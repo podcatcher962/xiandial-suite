@@ -1,0 +1,194 @@
+# ============================================================
+#  观音灵签 (LingQian) 固件 —— 发布版 .gitignore
+#  目标：0 台单 + 不泄露任何敏感内容
+#  ★ 本文件是从拾声仓库拷来后改的。凡是「拾声专属」的条目对本仓库
+#    仍然生效（因为底座代码同源），但英文版 en/ 已整体排除（见 ⑩）。
+# ============================================================
+
+# ---- ① 编译产物 ----
+build/
+build_pub/
+build_en/
+sdkconfig.old
+*.elf
+*.map
+*.bin.part
+
+# ---- ② ★ 台单字库：只排【自用版】，发布版字库必须进仓库 ----
+#   自用版 xs_font_st12/16.c 是拿【1254 个真实台名里出现的字】烘出来的字形。
+#   台单文件置空了、这两个文件照旧进仓库，
+#   等于把台单以【字形】形式留在固件里 —— 置空白做。
+#   ⇒ 排除它们。
+#
+#   ⚠️ 通配符 `xs_font_st*.c` 【不匹配】发布版的 xs_font_pub_st12.c
+#      （pub 在 st 前面），所以发布包自带通用汉字字库、能开箱即编。
+#      ★ 这一点改文件名时极易踩：若把发布版改名成 xs_font_st12_pub.c，
+#        会被这条规则一起排掉，发布包就缺字库、链接期报 undefined reference。
+#        已用 fnmatch 逐个验证过（2026-09-15）。
+main/fonts/xs_font_st*.c
+main/fonts/xs_font_st*.bin
+main/fonts/_old_simhei_10MB/
+
+# ---- ②b ★ 已废弃内容的本地归档（绝不入库）----
+#   main/_retired/ 是我把废弃文件移过去的地方（不是删，是挪）：
+#     xs_font_st24.c        死符号档位，1.21 MiB，已从 CMakeLists 与 UI 移除
+#     _old_simhei_10MB/     旧专有字体（simhei/Deng）留档，权利人是中易+方正
+#   ⚠️ 里面的 simhei 字库是【专有字体】，绝对不能进公开仓库。
+#     移到 _retired/ 只是为了本地还能翻查，不是「归档即可发布」。
+main/_retired/
+_retired/
+
+# ---- ③ 字体源文件（体积大，且授权需各自带 OFL）----
+#   Ark Pixel 与思源黑体的 .ttf/.otf 本体不入库（合计 ~20 MB），
+#   但两份 OFL-1.1 授权文本必须随包（下面 !OFL-*.txt 放行）。
+_fontsrc/
+*.ttf
+*.otf
+*.zip
+!OFL-*.txt
+
+# ---- ④ ★ 台单数据（自用版才有的那一批）----
+#   net_stations.c / .h 是【自用版】产物（含港澳台/海外真实地址）。
+#   发布版改用 net_stations_pub.c / .h（0 条，约 1.2 KB）—— 这份进仓库。
+#   ⇒ 仓库里只保留 _pub 那份；自用版文件本地保留、不提交。
+main/net_stations.c
+main/net_stations.h
+
+# ---- ④b ★ 收藏播种名单（10-06：源码扫描查不出来的那类泄漏）----
+#   net_stations_seed.h 里是兰兰常听的 10 个真实台名（上海戏曲广播、上海交通、
+#   上海第一财经、宁波交通…）。它原本硬编码在 app_fav.c 的 k_seed[] 里，
+#   结果发布版固件的 .bin 里带着这五个台名 —— 不是 URL、不是路径、不是凭据，
+#   只是一个中文字符串，_release_gitscan 规则全绿也照样漏过去，
+#   最后是靠【直接 grep 编译产物】抓到的。
+#   ⇒ 名单本体随台单版本走：自用版这份排除，发布版【不 include 任何名单】
+#     （CMakeLists 用 XS_FAV_PUBLISH 宏关掉播种）。
+main/net_stations_seed.h
+
+# ---- ④c ★ 版本排障笔记（10-06 隐私审计第三版）----
+#   app_version_note_local.h 里是 v1.51 的完整排障记录，含【第三方公网电台 IP】
+#   （排查 https 失败时用 st_net 测过的目标）与兰兰的诊断过程。
+#   它不是"预置的服务器地址"，但发布版二进制带着它 ⇒ 会被读成有固定出站目标。
+#   ⇒ 只本地保留；发布版 app_version.h 走 XS_FAV_PUBLISH 分支的简短说明。
+main/app_version_note_local.h
+
+# ---- ⑤ ★ 本机路径 / 账号 / 凭据（一律不能进仓库）----
+*.bak
+*.bak-*
+_reveal/
+sdkconfig.defaults.local
+build_manifest*.json
+_build*.log
+_fw_snap*.json
+
+# ---- ⑥ 私有数据源（生成器读它们抽台单）----
+_live_stations*.json
+_stations_hai.json
+xixiazi/
+xianghai-private/
+
+# ---- ⑦ 日常脚本的临时产物 ----
+_flash.log
+_stnet.log
+_probe_formats.out
+_test_stations.tsv
+
+# ---- ⑧ 工具缓存 ----
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+
+# ---- ⑧b ★ ESP-IDF 自动拉取的第三方组件（10-06 扫描时才发现）----
+#   managed_components/ 是 idf.py build 时按 dependencies.lock 自动 clone 的
+#   （lvgl__lvgl 一个就 6980 个文件、含全部 docs/demo/devcontainer）。
+#   ★ 它们不是我们的源码，进仓库会造成三个问题：
+#     ① 体积：单 LVGL 就几十 MB，仓库瞬间变重、clone 变慢；
+     ② 许可：LVGL 是 MIT，但把别人的 docs/CI 配置混进自己的仓库，
+#        让人误以为是我们的作品；
+     ③ 安全：docs 里那些 /home/joe/、邮箱、"E:cursor.png" 之类的字符串
+#        会被发布扫描当成泄漏，白花时间排查（我第一次跑扫描就被它刷了 100 条）。
+#   ⇒ 靠 dependencies.lock + main/idf_component.yml 恢复，clone 下来
+#     第一次 build 会自动重新拉（需要网络）。
+managed_components/
+
+# ---- ⑨ 编辑器 ----
+.vscode/
+.idea/
+*.swp
+*~
+
+# ==== ⑩ ★★★ 灵签专属：拾声残留一律不进仓库 ====
+#   本仓库是从 xiandial-radio 拷来做第二个产品的（灵签）。拷的时候把
+#   整个目录树都带过来了，于是下面这些东西【物理上还在本地】，
+#   但它们要么属于另一个产品（英文版）、要么是灵签用不到的台源工具。
+#
+#   ★ 为什么用 gitignore 而不是删文件：
+#     ① 底座代码同源，删了以后想对比两台机器的差异就没有参照；
+#     ② 更要紧的是 —— 【只在一侧建防线 =另一侧必然踩坑】。
+#       拾声仓库那边的防线（这些文件的处置规则）写在它自己的
+#       .gitignore 与发布检查脚本里，两边各有一份才会漂移。
+#       这里只做「灵签仓库不收它」，规则本身写在 README 的
+#      「仓库里有什么」表格里，让人可查。
+# ★★★ 2026-10-08 发布拾声集前修：**.gitignore 不支持行内注释**
+#   git 会把「模式 + 行尾那串 # 注释」整体当成一个文件名来匹配，
+#   于是一行也匹配不上 —— 规则【静默失效】，而且没有任何报错。
+#   本段原有 7 条规则全犯了这个错（en/ 那行最严重：240 MB，
+#   且里面带着自用版台名字库与含第三方公网 IP 的排障笔记，都会被打进仓库）。
+#   ⇒ 规则一律【单独成行】，注释写在它上面一行。
+#   ⚠️ 加规则后用这条命令自查（应能列出所有被忽略的文件）：
+#        git check-ignore -v <路径>
+en/
+_en_snap_before.json
+FLASHING.en.md
+# Ark Pixel 是拾声用的字体，拾声集已改用霞鹜文楷 ⇒ 它的许可不必随本仓库
+OFL-1.1-Ark-Pixel.txt
+# ★★ 思源黑体【仍在用】（作为补字字体，见 gen_fonts.py 的 FALLBACK_TTF）
+#    ⇒ 它的 OFL 许可【必须随仓库】。下面这行【故意注释掉】，不是漏写：
+#      README 的「授权与致谢」一节明确列了思源黑体，许可文件必须能对上。
+# OFL-1.1-Source-Han-Sans.txt
+# 灵签字号档是 14/18/22/30，12/16/24 是拾声的残留
+main/fonts/xs_font_12.c
+main/fonts/xs_font_16.c
+main/fonts/xs_font_24.c
+# 拾声界面层；拾声集用的是 ui_lingqian.c / ui_radio_v.c（CMake 已二选一）
+main/ui_xiandial.c
+main/ui_xiandial.h
+# 台源制作器（HTML）；拾声集的台单工具见 tools/_sd_push.py
+tools/XianForge.html
+tools/XianForge.en.html
+tools/_xf_*.js
+tools/_xf_*.py
+tools/_xf_fw_en_*.py
+tools/_fw_en_*.py
+tools/_make_xianforge_en*.py
+tools/_gen_fw_en.py
+tools/_sd_cmd.py
+
+# ★★ 2026-10-08：下面两条【已从排除里移出】，理由：
+#   README.en.md  —— 拾声集是独立开源的，需要自己的英文 README（本次已重写）
+#   _sd_push.py   —— 拾声集【有电台产品】，README 的「加自己的电台」一节
+#                    明确指向这个脚本；排除它用户就拿不到工具。
+#                   （灵签时期排它是对的：灵签不读台单。现在形态变了。）
+#   ⚠️ 教训：排除列表要跟着【产品形态】走。产品加了功能，
+#      被排除的工具可能一夜之间变成必需 —— 反过来也一样。
+
+
+# ---- ⑪ ★ 本地调试产物（灵签专用）----
+#_build_lq.log / _flash_lq.log 已被 ⑤ 的 _build*.log / _flash.log 盖住
+_flash_lq.log
+_lq_art/
+_lq_audio/
+*.mp3                 # ★ 100 签语音不进仓库：15.7 MB 且是生成物，
+#  SD 卡上是推过去的，不是烧进 flash 的
+
+# ★ 2026-10-08：归档的旧 README（灵签版「观音灵签机」与拾声英文版）
+#   保留在本机供查阅，但【不进仓库】—— 发布物只该有一份当前 README，
+#   多份会让人分不清哪份是准的。
+_docs_old/
+
+# ★ 2026-10-08 发布前扫描发现：
+#   _saves/ 是固件存档（bin + 源码快照，每个 4~6 MB，会随版本无限增长），
+#   发布仓库不需要它；_bak_1018/ 是重跑字库前的临时备份。
+#   这两个目录里的 .c 副本还带着【本机绝对路径】，会把发布物弄脏。
+_saves/
+main/fonts/_bak_1018/
