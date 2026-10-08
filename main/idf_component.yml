@@ -1,0 +1,16 @@
+dependencies:
+  # ★ 10-06：把 >=5.4 改成 >=6.0。理由是本工程的 CMakeLists 里用了
+  #   esp_driver_i2s / esp_driver_sdmmc / esp_driver_ledc / esp_driver_usb_serial_jtag
+  #   这几个【独立 driver 组件】—— 它们在 5.x 后期虽然也拆出来了，但
+  #   esp_driver_usb_serial_jtag 与部分 header 的挂载位置在 5.x/6.x 之间有差异，
+  #   声明 5.4 会让使用者在 5.x 上编到一半报「找不到组件」。
+  #   ⇒ 宁可要求高一点，也不要让人卡在 CMake 上。本工程实际编译于 IDF 6.1。
+  idf: ">=6.0"
+  lvgl/lvgl: "^9"
+  espressif/esp_lvgl_port: "^2"
+  espressif/esp_lcd_st77922: "^2"
+  espressif/esp_lcd_touch_ft5x06: "^1"
+  espressif/esp_lcd_touch: "^1"
+  espressif/esp_codec_dev: "^1.6"
+  # MP3 解码（本地 SD 点播 + 网络电台流都要用它）
+  espressif/esp_audio_codec: "^2"
