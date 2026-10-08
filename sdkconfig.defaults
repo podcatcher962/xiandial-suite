@@ -1,0 +1,92 @@
+# ---- 目标芯片 ----
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---- Flash 16MB ----
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+# 自定义分区：app 7MB（字库 1.7MB + LVGL，后面还要塞 WiFi/音频解码）
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- PSRAM 8MB Octal ----
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+
+# ---- CPU ----
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_FREERTOS_HZ=1000
+
+# ---- 日志走 USB-Serial-JTAG（板子 Type-C 直连，免驱；方便排障）----
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_ENABLED=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ---- 主任务栈 ----
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# ---- LVGL 9 ----
+CONFIG_LV_COLOR_DEPTH_16=y
+CONFIG_LV_OS_FREERTOS=y
+CONFIG_LV_USE_LOG=n
+
+# ---- LVGL 内存池（★ 10-02 真机 panic 的根因，10-03 二次校准，10-08 三次校准）----
+# 默认只有 65536 B = 64 KB，而且【不会自动扩容】。
+# 本工程 UI 有 5 个页面 + 导航 + 顶栏，约 150 个 lv_obj，静置就吃掉 ~70 KB；
+# 再叠加 FULL 渲染模式下每帧几十个 draw task 的峰值 malloc，
+# 64 KB 池必然耗尽 -> 见 src/draw/lv_draw.c:98-100：
+#     lv_draw_task_t * new_task = lv_malloc_zeroed(...);   // 返回 NULL
+#     LV_ASSERT_MALLOC(new_task);                          // release 构建里是空操作
+#     new_task->area = *coords;                            // 往 NULL 写 -> StoreProhibited
+# 现象：开机进主屏 / 切到「夜间」这种复杂页就无限重启（Guru Meditation StoreProhibited）。
+#
+# ★ 10-03 二次校准：先提到 192 KB 之后，屏能亮、音频能响，但
+#   `esp_wifi_init()` 报 ESP_ERR_NO_MEM —— 因为这块池是【静态 .bss】，
+#   192 KB 直接吃掉内部 SRAM 的 37%，把内部 DMA RAM 挤到只剩 31 KB。
+#   真机日志给出的实测值：LVGL pool size=187692 free=125940 used=33% peak=61752 B
+#   ⇒ 峰值只用 61.7 KB。降到 112 KB（≈1.8 倍峰值，留足加页面的余量），
+#     一次让出 80 KB 内部 RAM 给 WiFi / I2S / SD。
+#   改小之后必须同时确认这两行日志还在：
+#     XSUI:  LVGL pool: ... peak=... B      （peak 不得逼近 size）
+#     XSSYS: net ready (STA, not connected)
+#
+# ★★ 10-08 第四次校准（K线屏「上下两屏」）—— 64 KB 已经不够，抬到 96 KB：
+#   现场：从股票列表点进 K线屏几秒后板子自己重启，
+#         PC=lv_draw_add_task()  lv_draw.c:100   EXCVADDR=0x8（往 NULL+8 写）
+#         ⇒ 池里 lv_malloc 返回了 NULL，不是我的绘制代码有问题。
+#   为什么 K线屏特别吃池：lv_line 是【每段一个 draw task】——
+#         分时折线 48 点 = 47 段，三条均线 26/21/11 点 = 55 段，
+#         再加 60 根蜡烛 + 12 条网格线，一次刷新瞬时就要 180 多份。
+#   修了两处：
+#     ① 进 K线屏时把【被全屏盖住的列表屏】拆掉（返回时重建）—— 省下一整屏对象；
+#     ② 池 65536 → 98304。
+#   实测（lq_mem，1 个产品页 + K线屏）：峰值 56,496 / 可用 61,576 = 91.7%，
+#   只剩 8% 余量 ⇒ 不加这一步，下一个产品（拾声电台页）必然再炸。
+#   ⚠ 代价是内部 RAM 少 32 KB（75,443 → 约 43,000）。有先例可依：
+#     拾声自用版曾经就是用 112 KB 的池跑网络电台的（当时内部只剩 16.5 KB）。
+#   ⚠ 判据仍以真机 `lq_mem` 的 peak 为准：池见底 = lv_malloc 返回 NULL，
+#     release 构建下静默崩溃。若日后再加复杂页面，先看 peak 再调这一行。
+CONFIG_LV_MEM_SIZE=98304
+
+# ---- LVGL 内存断言（10-08 加）----
+# 上面那次崩溃之所以难查，是因为 release 构建下 LV_ASSERT_MALLOC 是空操作，
+# 池见底的表现是「随机重启」而不是一句 "Out of memory"。
+# 打开它之后，同样的错误会直接打出文件:行号 + 原因，一眼定位。
+CONFIG_LV_USE_ASSERT_MALLOC=y
+
+# ---- 看门狗（LVGL 大刷新时别饿死）----
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+CONFIG_ESP_INT_WDT=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+
+# ---- FATFS 文件名编码（★ 10-03 真机踩到）----
+# 默认是 ANSI_OEM + CODEPAGE_437，只认西欧字符：
+#   卡里的中文目录名被转成一串乱码并退化成 8.3 短名（"城市声音志" -> "С????~1"），
+#   拿这个坏名字回传 opendir() 直接失败 -> 递归数音频得到 0 个。
+#   ⇒ 必须用 UTF-8：FAT32 本身存的是 UTF-16 长名，UTF-8 模式才能原样取回来。
+#   （长文件名支持 CONFIG_FATFS_LFN_HEAP 默认已开，不用管。）
+CONFIG_FATFS_API_ENCODING_UTF_8=y
