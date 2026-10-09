@@ -121,6 +121,8 @@ static int       s_cur_view;
 /* 电台列表 */
 static rowlist_t s_rl_st;
 static lv_obj_t *s_lbl_sum;
+static lv_obj_t *s_lbl_empty;        /* 列表空态：0 台 / 筛选无结果 */
+static lv_obj_t *s_lbl_empty_sub;
 static int      *s_pool;             /* 筛选后的台下标（PSRAM）*/
 static int       s_pool_n;
 static int       s_f_cat  = -1;      /* -1 = 不筛 */
@@ -251,6 +253,35 @@ static void apply_filter(void)
     }
 }
 
+/* ---------- 列表空态 ----------
+ *  ★ 发布版内置 0 条台单 ⇒ 进电台页就是一片空白面板，
+ *    看起来像"机器坏了"，而不是"还没导入台源"。
+ *    自用版内置 1254 台，这条只在"筛选筛空"时露头。
+ *  ★ 空态分两种，文案必须分开：
+ *    ① 总量为 0        —— 用户还没导台源（发布版默认形态）
+ *    ② 总量不为 0 但筛空 —— 他自己选的档里没台，换个档就有
+ *    混成一句会导致 ① 的用户被误导成"分类选错了"。*/
+static void refresh_empty(void)
+{
+    if (!s_lbl_empty || !s_lbl_empty_sub) return;
+
+    bool empty = (s_pool_n == 0);
+    if (empty) {
+        if (app_st_count() == 0) {
+            lv_label_set_text(s_lbl_empty,     "还没有电台");
+            lv_label_set_text(s_lbl_empty_sub, "把 stations.tsv 放进 TF 卡");
+        } else {
+            lv_label_set_text(s_lbl_empty,     "这一档还没有电台");
+            lv_label_set_text(s_lbl_empty_sub, "换个分类或地区看看");
+        }
+        lv_obj_clear_flag(s_lbl_empty,     LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_lbl_empty_sub, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_lbl_empty,     LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_lbl_empty_sub, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void refresh_sum(void)
 {
     if (!s_lbl_sum) return;
@@ -279,6 +310,8 @@ static void refresh_sum(void)
     else
         snprintf(b, sizeof(b), "共 %d 台 · %s · %s", s_pool_n, c, p);
     lv_label_set_text(s_lbl_sum, b);
+
+    refresh_empty();      /* ★ 台数变了，空态提示必须跟着走 */
 }
 
 /* ============================================================
@@ -557,6 +590,14 @@ static void build_list_view(void)
     mk_box(p, 20, 116, SCR_W - 40, 1, C_LINE, 0);
 
     rl_build(&s_rl_st, p, LIST_TOP, KIND_ST, st_row_cb);
+
+    /* ★ 空态提示：发布版内置 0 条台单 ⇒ 列表区不能是一片空白，
+     *   否则看起来像"机器坏了"。自用版永远看不到这一条。
+     *   y 取在列表区（LIST_TOP=118..480）的视觉中心偏上。*/
+    s_lbl_empty     = mk_clab(p, 248, SCR_W, 0, F_READ,  C_MUTE, "还没有电台");
+    s_lbl_empty_sub = mk_clab(p, 288, SCR_W, 0, F_SMALL, C_MUTE, "");
+    lv_obj_add_flag(s_lbl_empty,     LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_lbl_empty_sub, LV_OBJ_FLAG_HIDDEN);
 }
 
 /* ============================================================
@@ -966,6 +1007,7 @@ void ui_radio_v_leave(void)
 
     for (int i = 0; i < V_N; i++) s_view[i] = NULL;
     s_lbl_sum = s_play_name = s_play_state = s_play_btn_lab = s_lbl_vol = NULL;
+    s_lbl_empty = s_lbl_empty_sub = NULL;
     s_cat_body = s_cat_tab[0] = s_cat_tab[1] = s_sd_path = NULL;
     for (int i = 0; i < BAR_N; i++) s_bars[i] = NULL;
     memset(&s_rl_st, 0, sizeof(s_rl_st));
@@ -974,6 +1016,14 @@ void ui_radio_v_leave(void)
     s_pool_n = 0;
     s_cur_pos = -1;
     s_playing_local = false;
+
+    /* ★★ 10-09：筛选条件必须跟池子一起复位。
+     *   原来 s_f_cat / s_f_prov 是 static，leave 却只清池子不清它们 ⇒
+     *   退出电台再进来，仍停在上次的「栏目/地区」上，而 summary 行已按
+     *   新池子重算 —— 用户看到的是一屏莫名其妙被筛剩的台，还以为台单丢了。
+     *   电台页是「进去就该是全部台」的语义，记住筛选反而是惊吓。*/
+    s_f_cat  = -1;
+    s_f_prov = -1;
 
     /* 两块 PSRAM 缓冲随本 App 一起释放（进入才创建、离开即销毁）*/
     if (s_pool)    { heap_caps_free(s_pool);    s_pool = NULL; }
