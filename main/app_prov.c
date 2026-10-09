@@ -40,9 +40,22 @@ static const char *TAG = "XSPROV";
 static volatile bool s_on = false;
 static char     s_ssid[APP_PROV_SSID_MAX] = "";
 static volatile int s_result = PROV_RESULT_NONE;
+/* ★★ 10-09：网页提交的那一刻（tick）。判「配网真的连上了」必须带上它。
+ *   原因见 prov_really_ok() 上方的注释 —— 不记这个，提交瞬间的
+ *   「残留连接」会被当成成功报给手机，而板子其实还没连上。*/
+static volatile TickType_t s_submit_tick = 0;
 static httpd_handle_t   s_httpd = NULL;
 static volatile int     s_dns_alive = 0;
 static volatile int     s_dns_sock = -1;
+
+/* ★★ 10-09 真机踩爆：AP netif 句柄原来写在 ap_start() 体内当 static 局部量，
+ *   而 ap_stop() 够不着它 —— esp_netif_destroy() 之后那个 static 仍指着
+ *   已经销毁的 netif。于是【第二次】开启配网时 `if (!ap_netif)` 判为非空、
+ *   跳过创建，直接拿野指针去 esp_netif_set_ip_info() ⇒ Guru Meditation ⇒ 整机复位。
+ *   真机现象：第一次点「配网」正常，关掉再开（或连点两次）板子就重启，
+ *   重启后热点自然没了 —— 看起来像「点配网会重启，而且没有配网页面」。
+ *   ⇒ 句柄必须提到文件作用域，销毁与置空成对出现，缓存才和实际同源。*/
+static esp_netif_t *s_ap_netif = NULL;
 
 /* ============================================================
  *  1) 热点
@@ -63,11 +76,10 @@ static esp_err_t ap_start(void)
         snprintf(s_ssid, sizeof(s_ssid), "XianDial");
     }
 
-    /* 记下 AP netif 句柄，后面 stop 要销毁它 —— 靠 ifkey 反查虽然也能，
-     * 但创建时直接存最省事，也少一次字符串比较。*/
-    static esp_netif_t *ap_netif = NULL;
-    if (!ap_netif) ap_netif = esp_netif_create_default_wifi_ap();
-    if (!ap_netif) {
+    /* ★ 句柄统一用文件作用域的 s_ap_netif（根因见文件头）：
+     *   创建与销毁必须成对，不能"创建时存进局部 static、销毁时反查句柄"。*/
+    if (!s_ap_netif) s_ap_netif = esp_netif_create_default_wifi_ap();
+    if (!s_ap_netif) {
         ESP_LOGE(TAG, "创建 AP netif 失败");
         return ESP_FAIL;
     }
@@ -82,7 +94,7 @@ static esp_err_t ap_start(void)
     esp_netif_str_to_ip4("255.255.255.0", &m4);
     esp_netif_str_to_ip4("192.168.4.1", &g4);
     ip.ip = a4; ip.netmask = m4; ip.gw = g4;
-    esp_netif_set_ip_info(ap_netif, &ip);
+    esp_netif_set_ip_info(s_ap_netif, &ip);
 
     wifi_config_t wc = { 0 };
     strncpy((char *)wc.ap.ssid, s_ssid, sizeof(wc.ap.ssid) - 1);
@@ -111,8 +123,13 @@ static esp_err_t ap_start(void)
 static void ap_stop(void)
 {
     esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_netif_t *n = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (n) esp_netif_destroy(n);
+    /* ★ 销毁后【务必置空】—— 这就是本文件复位崩溃的根因（详见文件头）。
+     *   原来这里靠 ifkey 反查句柄去销毁：n 被销毁了，可 ap_start 里缓存
+     *   的那个 static 仍指着同一块内存 ⇒ 下次开启跳过创建、直接踩野指针。*/
+    if (s_ap_netif) {
+        esp_netif_destroy(s_ap_netif);
+        s_ap_netif = NULL;
+    }
 }
 
 /* ============================================================
@@ -145,7 +162,10 @@ static const char PROV_HTML[] =
 ".hide{display:none}"
 "</style></head><body>"
 "<h1>拾声集 XianDial Suite</h1><p class=sub>选一下你家的 WiFi，填密码就能连</p>"
-"<label>WiFi 名称</label><select id=ss></select>"
+"<label>WiFi 名称</label><select id=ss>"
+/* ★ 静态兜底：即使 JS 没跑起来或 fetch 失败，下拉里也有话说，
+ *   而不是一个彻底空白的框（兰兰 10-09 报的正是「下拉是空的」）。*/
+"<option value=''>- 正在扫描附近的 WiFi… -</option></select>"
 "<div id=man class=hide><label>手动输入名称</label><input id=mss "
 "placeholder=\"例如 ChinaNet-8f2a\"></div>"
 "<label>密码（开放网络留空）</label><input id=pw type=password "
@@ -157,14 +177,23 @@ static const char PROV_HTML[] =
 "var ss=document.getElementById('ss'),mss=document.getElementById('mss'),"
 "pw=document.getElementById('pw'),go=document.getElementById('go'),"
 "st=document.getElementById('st'),man=document.getElementById('man');"
+/* ★ 10-09：0 条时给一句明说，并【总是】保底留「手动输入」这一项 ——
+ *   下拉里没有任何可选项，用户会以为机器坏了，其实扫不到/扫失败
+ *   都可以手打 SSID 连（这是产品说明里就写好的兜底入口）。*/
 "function draw(a){ss.innerHTML='';var o=document.createElement('option');"
-"o.value='';o.textContent='- 请选择 -';ss.appendChild(o);"
+"o.value='';"
+"o.textContent=a.length?'- 请选择 -':'- 没扫到网络，请用下面的手动输入 -';"
+"ss.appendChild(o);"
 "a.forEach(function(n){var e=document.createElement('option');e.value=n.s;"
 "e.textContent=n.s+'  ('+n.q+')';ss.appendChild(e)});"
 "var m=document.createElement('option');m.value='__manual__';"
 "m.textContent='> 列表里没有？手动输入';ss.appendChild(m)}"
-"function load(){fetch('/ssids').then(function(r){return r.json()})"
-".then(function(j){draw(j.a||[])}).catch(function(){})}"
+/* ★ 10-09：取列表前先给「正在扫描…」的回执。后端若需补扫要等 2~5 秒，
+ *   这段时间下拉不该是一片沉默。失败也走 draw([])，仍然是可用的。*/
+"function load(){ss.innerHTML='';var w=document.createElement('option');"
+"w.value='';w.textContent='- 正在扫描附近的 WiFi… -';ss.appendChild(w);"
+"fetch('/ssids').then(function(r){return r.json()})"
+".then(function(j){draw(j.a||[])}).catch(function(){draw([])})}"
 "ss.onchange=function(){man.className=(ss.value=='__manual__')?'':'hide'};"
 "go.onclick=function(){var s=(ss.value=='__manual__')?(mss.value.trim()):ss.value;"
 "if(!s){st.textContent='先选一个 WiFi';return}"
@@ -238,6 +267,21 @@ static esp_err_t h_root(httpd_req_t *r)
 
 static esp_err_t h_ssids(httpd_req_t *r)
 {
+    /* ★★ 10-09 兜底（配网页下拉永远为空的第二道防线）：
+     *   正常路径是 app_prov_start() 在开热点【之前】就把扫描结果填好 ——
+     *   见那里的说明。这里只在「表还是空的」时才补扫一次，并【等】它扫完
+     *   （最多 5 秒），而不是直接回一个空数组让用户对着空下拉发呆。
+     *
+     *   ⚠️ 为什么这条路要尽量少走：本机单射频，全信道扫描期间 SoftAP 会
+     *      暂停，正在看这一页的手机可能短暂断连。所以它是兜底、不是主路。
+     *   ⚠️ 这里跑在 httpd 任务上，vTaskDelay 会占住该任务几秒 —— 此刻
+     *      用户正等着「附近的 WiFi」列表，等一下远好过返回空列表。*/
+    if (app_net_scan_count() == 0) {
+        ESP_LOGW(TAG, "/ssids: 结果为空，就地补扫一次");
+        app_net_scan_start();
+        for (int i = 0; i < 50 && app_net_scan_running(); i++) vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
     /* 24 条 × (32 字节 SSID 转义后可能翻倍) ⇒ 2 KB 够。放 PSRAM，别抢内部 RAM。*/
     char *buf = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) buf = malloc(2048);
@@ -268,12 +312,39 @@ static esp_err_t h_ssids(httpd_req_t *r)
     return e;
 }
 
+/* ★★ 10-09：配网到底成没成 —— 判据必须带「提交后 ≥2 秒」这道门槛。
+ *
+ *   踩到的真实现象：手机网页报「连上了！可以关掉这个网页了」，而同一时刻
+ *   板子屏上却写着「正在连接…」、设置面板里也是「连接中」。两边判据本来
+ *   读的是同一份数据，为什么会打架？
+ *   —— h_connect() 是先 esp_wifi_disconnect() 再 esp_wifi_connect()，而断开
+ *      事件是【异步】送达的。在它到达之前 s_net_connected 仍然是上一次连接
+ *      留下的 true。此刻判「已连上」就是假象：手机被报了成功，板子实际正在
+ *      重连（甚至最终连不上）。
+ *   ⇒ 提交后头 2 秒一律不认成功；过了 2 秒 connected 仍为真才可信。
+ *     （正常重连 1~3 秒完成，所以这道门槛不会拖慢真实成功。）*/
+static bool prov_really_ok(void)
+{
+    if (!app_net_connected())  return false;
+    if (s_submit_tick == 0)    return false;
+    return (TickType_t)(xTaskGetTickCount() - s_submit_tick) > pdMS_TO_TICKS(2000);
+}
+
 static esp_err_t h_state(httpd_req_t *r)
 {
     int r0 = s_result;
     if (r0 == PROV_RESULT_DOING) {
-        if (app_net_connected()) r0 = PROV_RESULT_OK;
+        if (prov_really_ok())                          r0 = PROV_RESULT_OK;
         else if (app_net_link_state() == APP_NET_FAIL) r0 = PROV_RESULT_FAIL;
+        /* 只在「结果」或「connected」发生变化时打一行 —— 免刷屏，又留下铁证：
+         * 下次真机配网，这行日志就是「手机看到了什么、板子当时什么状态」的原样记录。*/
+        static int last = -1;
+        int key = r0 * 2 + (app_net_connected() ? 1 : 0);
+        if (key != last) {
+            ESP_LOGI(TAG, "/state -> r=%d connected=%d ssid=\"%s\"",
+                     r0, (int)app_net_connected(), app_net_ssid());
+            last = key;
+        }
     }
     char buf[200] = "";
     snprintf(buf, sizeof(buf),
@@ -288,10 +359,14 @@ static esp_err_t h_state(httpd_req_t *r)
 static void result_task(void *arg)
 {
     (void)arg;
-    /* 盯 45 秒。连上了就报成功，等 20 秒再关热点（页面已经显示成功）*/
+    /* 盯 45 秒。真连上了就报成功，再等 20 秒关热点（此时网页已显示成功）*/
     for (int i = 0; i < 45; i++) {
         vTaskDelay(pdMS_TO_TICKS(1000));
-        if (app_net_connected()) {
+        /* 热点被【外部】关掉了（用户点了「关闭热点」/ 又进了一次）：本任务
+         * 立刻退场。不然它会继续倒计时，在 45 秒时把 s_result 改成「失败」，
+         * 污染下一次配网的结果。*/
+        if (!s_on) { ESP_LOGI(TAG, "热点已关，结果任务退出"); vTaskDelete(NULL); return; }
+        if (prov_really_ok()) {
             s_result = PROV_RESULT_OK;
             ESP_LOGI(TAG, "配网成功 ip=%s ssid=%s", app_net_ip_str(), app_net_ssid());
             for (int k = 0; k < APP_PROV_AUTOCLOSE_S; k++) vTaskDelay(pdMS_TO_TICKS(1000));
@@ -350,11 +425,31 @@ static esp_err_t h_connect(httpd_req_t *r)
 
     ESP_LOGI(TAG, "网页提交：ssid=\"%s\"，密码 %s（%u 字节）",
              ssid, pass[0] ? "已填" : "空（开放网络）", (unsigned)strlen(pass));
+    s_submit_tick = xTaskGetTickCount();     /* ★ 判成功的「提交时刻」基准 */
     s_result = PROV_RESULT_DOING;
     esp_err_t cr = app_net_connect_creds(ssid, pass);
     ESP_LOGI(TAG, "app_net_connect_creds -> %s", esp_err_to_name(cr));
-    if (cr != ESP_OK) s_result = PROV_RESULT_FAIL;
-    else xTaskCreate(result_task, "xs_provres", 3072, NULL, 4, NULL);
+    if (cr != ESP_OK) {
+        s_result = PROV_RESULT_FAIL;
+    } else {
+        /* ★★ 10-09：原来这里【不看 xTaskCreate 的返回值】。结果任务一旦起不来
+         *   （配网时 SoftAP + HTTP + DNS 已把内部 RAM 吃紧），就没人把 s_result
+         *   推到「成功」、也没人 20 秒后关热点 —— 手机靠 /state 的实时判据或许
+         *   能报「连上了」，板子却永远停在「连接中」、热点永不自动关闭。
+         *   返回码必须查；第一次失败就降栈再试一次。*/
+        BaseType_t ok = xTaskCreate(result_task, "xs_provres", 3072, NULL, 4, NULL);
+        if (ok != pdPASS) {
+            ok = xTaskCreate(result_task, "xs_provres", 2560, NULL, 4, NULL);
+            ESP_LOGW(TAG, "结果任务 3072 创建失败，降栈 2560 重试 -> %s",
+                     ok == pdPASS ? "成功" : "仍失败");
+        }
+        if (ok != pdPASS) {
+            ESP_LOGE(TAG, "结果任务起不来（内部 RAM 不足）");
+            s_result = PROV_RESULT_FAIL;   /* 显式失败，好过 UI 永远停在「连接中」 */
+        } else {
+            ESP_LOGI(TAG, "结果任务已起（盯 45 秒）");
+        }
+    }
 
     httpd_resp_set_type(r, "application/json; charset=utf-8");
     return httpd_resp_send(r, "{\"r\":1}", 7);
@@ -442,6 +537,16 @@ static void dns_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+    /* ★★ 10-09：给 recvfrom 设 500ms 超时 —— 这是 DNS 任务能被可靠收掉的
+     *   唯一办法。原方案靠 app_prov_stop() 里 shutdown() 去"叫醒"它，
+     *   但 lwip 对 UDP socket 的 shutdown 叫不动阻塞中的 recvfrom：
+     *   实测关闭配网后迟迟不见「DNS 任务退出」，socket 不 close ⇒
+     *   端口 53 一直被占 ⇒ 紧接着再开配网就 "dns bind :53 失败" ⇒
+     *   没有 DNS 劫持 ⇒ 手机连上热点不会自动弹配网页。
+     *   有了超时，任务最多 500ms 就醒一次看 s_dns_alive，退出变得确定。*/
+    struct timeval tv = { 0, 500000 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     ESP_LOGI(TAG, "DNS 劫持已起（:%d，所有 A 查询 -> %s）",
              PROV_DNS_PORT, APP_PROV_IP_STR);
     s_dns_alive = 1;
@@ -450,10 +555,7 @@ static void dns_task(void *arg)
         struct sockaddr_in from;
         socklen_t fl = sizeof(from);
         int n = recvfrom(s, q, sizeof(q), 0, (struct sockaddr *)&from, &fl);
-        if (n < 12) {
-            if (n < 0) vTaskDelay(pdMS_TO_TICKS(20));   /* 让退出标志有机会生效 */
-            continue;
-        }
+        if (n < 12) continue;   /* 超时/出错都回 while 顶部看 s_dns_alive */
 
         int qd = (q[4] << 8) | q[5];
         if (qd < 1) continue;
@@ -503,6 +605,31 @@ esp_err_t app_prov_start(void)
 {
     if (s_on) return ESP_OK;
 
+    /* ★★ 10-09：先等上一次的 DNS 任务退干净（socket 已 close、端口已释放），
+     *   否则这次必然 "dns bind :53 失败" —— DNS 劫持一失效，手机连上热点
+     *   就不会自动弹配网页。dns_task 的 recvfrom 有 500ms 超时，最多等 1 秒。
+     *   把等待放 start（而不是 stop）里：用户点「开配网」本来就要等，
+     *   而关闭配网时不该在 UI 回调里卡半秒。*/
+    for (int i = 0; i < 100 && s_dns_sock >= 0; i++) vTaskDelay(pdMS_TO_TICKS(10));
+
+    /* ★★ 10-09 修「配网页里的 WiFi 名称下拉永远是空的」：
+     *   下拉的数据来自 s_aps[]/s_ap_count，而这对数据【只有】scan_task()
+     *   会写，scan_task 又只由 app_net_scan_start() 拉起 —— 可这个函数在
+     *   整个工程里从来没有被调用过（连同给它配套的
+     *   app_net_scan_sort_by_rssi() 一起成了死代码）。于是 /ssids 永远
+     *   返回 0 条，手机上那个下拉框只剩占位的两项。
+     *   ⇒ 在这里补上这根线。
+     *
+     *   为什么挑这个时机：此刻还是【纯 STA 模式】（ap_start() 里的
+     *   esp_wifi_set_mode(WIFI_MODE_APSTA) 还没执行），没有手机连着热点，
+     *   扫描最干净、不会打断任何人。等热点开起来、手机连上来再扫，
+     *   SoftAP 会因单射频切信道而暂停，手机可能掉线。
+     *
+     *   为什么不在这里等它扫完：扫描在独立任务里跑 2~3 秒，而用户接下去
+     *   还要「手机搜热点 → 连接 → 打开浏览器」，这段时间足够它跑完；
+     *   真赶不上，h_ssids() 还有一处兜底等待。*/
+    app_net_scan_start();
+
     s_result = PROV_RESULT_NONE;
     esp_err_t e = ap_start();
     if (e != ESP_OK) return e;
@@ -532,10 +659,13 @@ void app_prov_stop(void)
     if (!s_on && !s_httpd) return;
     s_on = false;
 
-    /* ★ 退出 DNS 任务：光置标志没用 —— 它正阻塞在 recvfrom 里。
-     *   用 shutdown() 把它叫醒，它看到 n<0 就会去检查标志。*/
+    /* ★ 退出 DNS 任务：只要置标志 —— dns_task 的 recvfrom 带 500ms 超时，
+     *   最多半秒就醒来看到 s_dns_alive==0，随即 close(s) 并退出。
+     *   这里【不等待】：本函数常在 LVGL 回调里跑，卡半秒就是掉帧；
+     *   "等它退干净"挪到 app_prov_start() 去等。
+     *   （历史：曾用 shutdown() 试图叫醒它 —— lwip 对 UDP socket 的
+     *     shutdown 叫不动阻塞中的 recvfrom，那条路是死的。）*/
     s_dns_alive = 0;
-    if (s_dns_sock >= 0) shutdown(s_dns_sock, SHUT_RDWR);
 
     if (s_httpd) {
         httpd_stop(s_httpd);
@@ -557,5 +687,30 @@ int app_prov_clients(void)
     return (int)lst.num;
 }
 
+int app_prov_scan_dump(void)
+{
+    /* 已经在扫就等它；扫完还是空，就再扫一次并等。
+     * ★ 判据全在这里打日志：真机上跑一条 `wifiscan`，就能分清
+     *   「扫不到周边网络（环境/射频问题）」和「扫到了但没接到下拉上（代码问题）」。*/
+    for (int i = 0; i < 60 && app_net_scan_running(); i++) vTaskDelay(pdMS_TO_TICKS(100));
+
+    if (app_net_scan_count() == 0) {
+        ESP_LOGI(TAG, "wifiscan: 当前结果为空，触发一次扫描");
+        app_net_scan_start();
+        for (int i = 0; i < 60 && app_net_scan_running(); i++) vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    int n = app_net_scan_count();
+    ESP_LOGI(TAG, "wifiscan: 共 %d 条（配网页「WiFi 名称」下拉将显示这些）", n);
+    for (int i = 0; i < n; i++) {
+        char nm[40] = "";
+        int  rssi = 0;
+        if (!app_net_scan_get(i, nm, sizeof(nm), &rssi)) break;
+        ESP_LOGI(TAG, "   [%02d] %-26s %4d dBm  %s", i, nm, rssi, signal_grade(rssi));
+    }
+    if (n == 0) ESP_LOGW(TAG, "wifiscan: 一条都没有 —— 检查 2.4G 是否可用/是否太远");
+    return n;
+}
+
 int  app_prov_result(void)        { return s_result; }
-void app_prov_clear_result(void)  { s_result = PROV_RESULT_NONE; }
+void app_prov_clear_result(void)  { s_result = PROV_RESULT_NONE; s_submit_tick = 0; }
