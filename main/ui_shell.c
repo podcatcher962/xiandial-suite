@@ -230,6 +230,42 @@ static lv_obj_t *s_cfg_info;                       /* 设备信息正文（10-08
 static lv_obj_t *s_cfg_sc;                         /* 面板的可滚动内容层（调试滚动用）*/
 static lv_timer_t *s_cfg_tick;                     /* 面板打开期间的 1Hz 刷新 */
 
+/* 前置声明：定义在下方，但两处调用点都早于定义处 */
+static void cfg_panel_destroy(void);    /* 拆设置面板（✕ 与「进配网」共用）*/
+static void prov_panel_open(void);      /* 打开全屏配网引导层 */
+
+/* ============================================================
+ *  ★★ 10-09 配网引导层（兰兰：「点配网会重启，而且没有配网的页面」）
+ * ============================================================
+ *  【重启】已查明是两个真 bug（AP netif 野指针、DNS 端口 53 不释放），
+ *  修在 app_prov.c。这里解决【没有配网的页面】的后半句 ——
+ *  原来设置面板里只有一行「配　网」，点开热点后屏上【没有一句话】
+ *  告诉用户接下来干什么：连哪个 WiFi？要不要密码？然后打开什么？
+ *
+ *  ⇒ 加一个【全屏引导层】，把三步写清楚 + 实时状态：
+ *      ① 手机连热点（SSID 用大字 + 金框顶在最显眼的位置）
+ *      ② 浏览器访问 192.168.4.1（多数手机连上会自动弹页，也写出来兜底）
+ *      ③ 网页里选家里 WiFi、填密码、保存
+ *     下方状态大字：等待手机连接 / 正在连接 / 配网成功 / 密码不对
+ *
+ *  ★ 生命周期：进层 = 开热点，出层 = 关热点。
+ *    唯一的出口是层的 ✕ 与底部按钮（两个走同一个回调 prov_close_cb）。
+ *    为什么"出层就关热点"：HTTP + DNS 两个任务 + lwip PCB 都白占内存；
+ *    而用户离开这页时，要么已经配好、要么放弃了 —— 两种都该关。
+ *    ⚠️ 例外：app_prov.c 内部还有一条"连上 20 秒后自动关热点"，
+ *       那条路会让热点在用户还看着页面时消失 ⇒ prov_refresh() 里
+ *       检测到 !active 就自己把层收尾，不留一个永远"等待中"的空壳。
+ *  ★ 层挂在主菜单屏上（与设置面板同一套路），【离开即删】。
+ * ============================================================ */
+#define PROV_CX   20
+#define PROV_CW   (SCR_W - 40)          /* 280 */
+
+static lv_obj_t *s_prov_panel;      /* 引导层根对象（非空 = 层开着）*/
+static lv_obj_t *s_prov_ssid_lbl;   /* 热点名（大字，就是手机要连的那个）*/
+static lv_obj_t *s_prov_state_lbl;  /* 状态大字 */
+static lv_obj_t *s_prov_sub_lbl;    /* 状态小字（已接入台数 / 操作提示）*/
+static lv_timer_t *s_prov_tick;     /* 层打开期间的 1Hz 刷新 */
+
 static void scls(lv_obj_t *par, int y, const char *name,
                  lv_obj_t **val_lbl, lv_event_cb_t cb)
 {
@@ -263,15 +299,45 @@ static void cfg_refresh(void)
     }
 }
 
+/* 拆掉设置面板。★ 顺序是硬规矩：先 lv_timer_del 再异步删对象 ——
+ *  面板打开期间有个 1Hz 的 cfg_tick_cb 每秒访问面板里的 label，
+ *  先删对象就是悬空指针（崩起来随机、最难查）。
+ *  两个调用点：面板自己的 ✕、以及「点配网 → 让位给全屏引导层」。
+ *  ★ 抽成函数而不是各写一遍：这两条路必须【行为完全一致】，
+ *    否则"从 ✕ 关"和"从配网关"会留下不同的残留状态。*/
+static void cfg_panel_destroy(void)
+{
+    if (s_cfg_tick) { lv_timer_del(s_cfg_tick); s_cfg_tick = NULL; }
+
+    /* ★ 异步删：本函数可能从面板【内部】的按钮回调里被调进来，
+     *   同步删 = 事件处理中途拆掉事件源对象的祖先。*/
+    if (s_set_panel) { lv_obj_del_async(s_set_panel); s_set_panel = NULL; }
+    s_cfg_vol_lbl = s_cfg_bl_lbl = s_cfg_snd_lbl = NULL;
+    s_cfg_snd_btn = NULL;
+    s_cfg_prov_btn = s_cfg_prov_lbl = NULL;
+    s_cfg_info = NULL;
+    s_cfg_sc = NULL;
+}
+
+/* ★★ 10-09 临时日志：兰兰反馈「调一次 ±20%，想改成 ±10」，可代码里
+ *   写的就是 ±10（见 scls 的两处 user_data）⇒ 只剩两种解释：
+ *     (a) 他看到的是旧固件，现在的 10 已经到位；
+ *     (b) 一次按压被上报两次（触摸抖动），数值连加两下，看起来翻倍。
+ *   这两种的修法完全不同（(a) 不用改、(b) 要给回调加防抖），不能盲改数值。
+ *   ⇒ 先打一行日志：点一次看到几行、每行 Δ 多少，一次就能定性。*/
 static void cfg_vol_cb(lv_event_t *e)
 {
-    xs_cfg_set_volume(xs_cfg_volume() + (int)(intptr_t)lv_event_get_user_data(e));
+    int d = (int)(intptr_t)lv_event_get_user_data(e);
+    xs_cfg_set_volume(xs_cfg_volume() + d);
+    ESP_LOGI(TAG, "cfg_vol: d=%+d -> %d", d, xs_cfg_volume());
     cfg_refresh();
 }
 
 static void cfg_bl_cb(lv_event_t *e)
 {
-    xs_cfg_set_backlight(xs_cfg_backlight() + (int)(intptr_t)lv_event_get_user_data(e));
+    int d = (int)(intptr_t)lv_event_get_user_data(e);
+    xs_cfg_set_backlight(xs_cfg_backlight() + d);
+    ESP_LOGI(TAG, "cfg_bl: d=%+d -> %d", d, xs_cfg_backlight());
     cfg_refresh();
 }
 
@@ -295,7 +361,19 @@ static void cfg_prov_refresh(void)
 
     char b[40];
     if (!app_prov_is_active()) {
-        lv_label_set_text(s_cfg_prov_lbl, "关 闭");
+        /* ★ 10-09：语义变了 —— 这一行现在是「进入配网界面」的入口，
+         *   不再是热点开关（热点的开关由引导层的进/出负责）。
+         *   所以未开时显示"未开启"，而不是原来的"关 闭"
+         *   （那会让用户以为点它是"关掉"什么东西）。
+         *   ★ 例外：配网刚成功、热点已自动关掉的那种情况是【好消息】，
+         *     显示"未开启"会让用户以为白配了 —— 这里要报成功的网名。*/
+        if (app_prov_result() == 2) {
+            snprintf(b, sizeof(b), "%.16s 已连上", app_net_ssid());
+            lv_label_set_text(s_cfg_prov_lbl, b);
+            lv_obj_set_style_text_color(s_cfg_prov_lbl, lv_color_hex(0x2E7D6E), 0);
+            return;
+        }
+        lv_label_set_text(s_cfg_prov_lbl, "未开启");
         lv_obj_set_style_text_color(s_cfg_prov_lbl, C_INK2, 0);
         return;
     }
@@ -327,19 +405,182 @@ static void cfg_prov_refresh(void)
     lv_obj_set_style_text_color(s_cfg_prov_lbl, C_GOLD, 0);
 }
 
+/* ---------- 配网引导层：状态刷新 / 关闭 / 建立 ---------- */
+
+static void prov_refresh(void)
+{
+    if (!s_prov_state_lbl) return;
+
+    /* ★ 热点不在了（可能是 app_prov.c 内部"连上 20 秒后自动关"，也可能是别处
+     *   调了 stop）⇒ 层自己收尾。不这么做的话，用户会盯着一个永远"等待中"
+     *   的空壳，而热点其实早关了 —— 这是最容易让人误判"配网坏了"的那种状态。*/
+    if (!app_prov_is_active()) {
+        /* ★ 10-09：热点不在时，要【先看结果】再定文案。
+         *   配网成功后 app_prov.c 会在 20 秒时自动关热点 —— 这一刻若无条件
+         *   写成「配网已结束」，用户就再也看不到「成功」这个关键结论
+         *   （真机走到过：手机报"连上了"，转头看板子却是灰字「已结束」，
+         *   等于把好消息抹掉了）。成功必须保留。*/
+        if (app_prov_result() == 2) {
+            lv_label_set_text(s_prov_state_lbl, "配网成功");
+            lv_obj_set_style_text_color(s_prov_state_lbl, lv_color_hex(0x2E7D6E), 0);
+            lv_label_set_text(s_prov_sub_lbl, "已连上家里的 WiFi，点下方返回");
+        } else {
+            lv_label_set_text(s_prov_state_lbl, "配网已结束");
+            lv_obj_set_style_text_color(s_prov_state_lbl, C_MUTE, 0);
+            lv_label_set_text(s_prov_sub_lbl, "热点已关闭，点下方返回");
+        }
+        return;
+    }
+
+    if (s_prov_ssid_lbl) {
+        /* ★ 热点名必须【完整】显示（不写死精度截断）—— 手机要连的就是它。
+         *   10-08 踩过：%.12s 把 "XianDial-XXXX" 的最后一位截掉，
+         *   两台设备显示成同一个名字，照输必然连不上。这里用 %.20s 兜住。*/
+        char b[32];
+        snprintf(b, sizeof(b), "%.20s", app_prov_ssid());
+        lv_label_set_text(s_prov_ssid_lbl, b);
+    }
+
+    const char *st  = "等待手机连接…";
+    lv_color_t  sc  = C_INK;
+    const char *sub = "按上面的步骤操作";
+    char        sb[32];
+
+    switch (app_prov_result()) {
+    case 1: st = "正在连接…"; sc = C_GOLD;                 break;
+    case 2: st = "配网成功";  sc = lv_color_hex(0x2E7D6E); break;   /* 墨绿：成功 */
+    case 3: st = "密码不对";  sc = C_SEAL;                 break;   /* 朱砂：出错 */
+    case 4: st = "参数不对";  sc = C_SEAL;                 break;
+    default: break;
+    }
+    if (app_prov_result() == 2) {
+        sub = "已连上家里的 WiFi";
+    } else if (app_prov_clients() > 0) {
+        snprintf(sb, sizeof(sb), "手机已接入 %d 台", app_prov_clients());
+        sub = sb;
+    }
+
+    lv_label_set_text(s_prov_state_lbl, st);
+    lv_obj_set_style_text_color(s_prov_state_lbl, sc, 0);
+    lv_label_set_text(s_prov_sub_lbl, sub);
+}
+
+static void prov_tick_cb(lv_timer_t *t)
+{
+    (void)t;
+    prov_refresh();
+}
+
+/* 关掉引导层：停 timer → 异步删层 → 关热点。
+ * ★ 层里的 ✕ 与底部按钮【共用】这一个回调 —— 两条路必须完全一致，
+ *   否则"点 ✕ 走"和"点按钮走"会留下不同的残局。*/
+static void prov_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_prov_tick) { lv_timer_del(s_prov_tick); s_prov_tick = NULL; }
+
+    /* ★ 异步删：本回调来自层内部的按钮，同步删 = 事件处理中途拆祖先对象。*/
+    if (s_prov_panel) { lv_obj_del_async(s_prov_panel); s_prov_panel = NULL; }
+    s_prov_ssid_lbl = s_prov_state_lbl = s_prov_sub_lbl = NULL;
+
+    /* 离开引导层 = 配网结束 ⇒ 关热点（AP + HTTP + DNS 一起收）。*/
+    if (app_prov_is_active()) app_prov_stop();
+    ESP_LOGI(TAG, "配网引导层已关闭，热点已收");
+}
+
+/* ★ 建立引导层并开热点。几何全部按下表排（320×480）：
+ *     y=22  标题「配　网」(30px)        y=16 ✕(44×44)
+ *     y=72  分割线
+ *     y=84  ①手机连这个 WiFi
+ *     y=116 热点名金框(280×46)  y=172 开放网络·不用密码
+ *     y=200 ②打开浏览器访问
+ *     y=228 192.168.4.1         y=258 多数手机会自动弹出
+ *     y=288 ③在网页里选家里 WiFi  y=316 填密码，点保存
+ *     y=346 分割线
+ *     y=356 状态大字             y=388 状态小字
+ *     y=418 [关闭热点，回首页](240×48)
+ *   ★ 每块的 y 都留了 ≥4px 净空，是因为各字号行高不同
+ *     （F_HERO 30→行高33，F_READ 22→27，F_MID 18→20，F_SMALL 14→17），
+ *     按"字号=行高"去排会叠字。改文案后要重新核行高。*/
+static void prov_panel_open(void)
+{
+    if (s_prov_panel) return;                 /* 已开着，别建第二个 */
+
+    if (!app_prov_is_active()) {
+        app_prov_clear_result();
+        esp_err_t r = app_prov_start();
+        if (r != ESP_OK) ESP_LOGW(TAG, "配网：开不了热点（%s）", esp_err_to_name(r));
+    }
+
+    lv_obj_t *p = lv_obj_create(s_home);
+    lv_obj_remove_style_all(p);
+    lv_obj_set_size(p, SCR_W, SCR_H);
+    lv_obj_set_pos(p, 0, 0);
+    /* ★ 全屏【不透明】底：配网时这一层就是主角，透出主菜单会显得脏。*/
+    lv_obj_set_style_bg_color(p, C_PAPER, 0);
+    lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_prov_panel = p;
+
+    sclabel(p, 22, SCR_W, 0, F_HERO, C_INK, "配　网");
+
+    lv_obj_t *x = sframed(p, SCR_W - 64, 16, 44, 44, C_PAPER2, 22, 1, C_LINE);
+    lv_obj_add_event_cb(x, prov_close_cb, LV_EVENT_CLICKED, NULL);
+    sclabel(x, 12, 44, 0, F_MID, C_INK2, "×");
+
+    sbox(p, PROV_CX, 72, PROV_CW, 1, C_LINE, 0);
+
+    /* 步骤 1：连热点。SSID 用大字 + 金框顶在最显眼处 —— 这是用户唯一要照抄的东西。*/
+    lv_obj_t *d1 = sbox(p, PROV_CX, 84, 22, 22, C_GOLD, 11);
+    sclabel(d1, 3, 22, 0, F_SMALL, C_PAPER2, "1");
+    slabel(p, PROV_CX + 32, 86, F_MID, C_INK, "手机连这个 WiFi");
+
+    lv_obj_t *box = sframed(p, PROV_CX + 24, 116, PROV_CW - 48, 46,
+                            C_PAPER2, 10, 1, C_GOLD);
+    s_prov_ssid_lbl = sclabel(box, 11, PROV_CW - 48, 0, F_READ, C_GOLD, "…");
+    sclabel(p, 172, SCR_W, 0, F_SMALL, C_MUTE, "开放网络 · 不用密码");
+
+    /* 步骤 2：开网页。多数 Android 连上开放热点会自动弹页，iOS 有时不弹，
+     *   所以"手动输网址"这条兜底必须写在屏上。*/
+    lv_obj_t *d2 = sbox(p, PROV_CX, 200, 22, 22, C_GOLD, 11);
+    sclabel(d2, 3, 22, 0, F_SMALL, C_PAPER2, "2");
+    slabel(p, PROV_CX + 32, 202, F_MID, C_INK, "打开浏览器访问");
+    sclabel(p, 228, SCR_W, 0, F_READ, C_GOLD, "192.168.4.1");
+    sclabel(p, 258, SCR_W, 0, F_SMALL, C_MUTE, "多数手机会自动弹出");
+
+    /* 步骤 3：网页里填。屏上没有键盘（兰兰否决过屏上打字），
+     *   输入全在手机网页里完成 —— 这句就是告诉他"键盘在手机上"。*/
+    lv_obj_t *d3 = sbox(p, PROV_CX, 288, 22, 22, C_GOLD, 11);
+    sclabel(d3, 3, 22, 0, F_SMALL, C_PAPER2, "3");
+    slabel(p, PROV_CX + 32, 290, F_MID, C_INK, "在网页里选家里 WiFi");
+    sclabel(p, 316, SCR_W, 0, F_SMALL, C_MUTE, "填密码，点保存");
+
+    sbox(p, PROV_CX, 346, PROV_CW, 1, C_LINE, 0);
+
+    s_prov_state_lbl = sclabel(p, 356, SCR_W, 0, F_READ, C_INK, "等待手机连接…");
+    s_prov_sub_lbl   = sclabel(p, 388, SCR_W, 0, F_SMALL, C_MUTE, "按上面的步骤操作");
+
+    lv_obj_t *b = sframed(p, 40, 418, SCR_W - 80, 48, C_PAPER2, 12, 1, C_SEAL);
+    lv_obj_add_event_cb(b, prov_close_cb, LV_EVENT_CLICKED, NULL);
+    sclabel(b, 14, SCR_W - 80, 0, F_MID, C_SEAL, "关闭热点，回首页");
+
+    prov_refresh();
+
+    if (s_prov_tick) lv_timer_del(s_prov_tick);
+    s_prov_tick = lv_timer_create(prov_tick_cb, 1000, NULL);
+
+    ESP_LOGI(TAG, "配网引导层已打开（热点 %s）",
+             app_prov_is_active() ? app_prov_ssid() : "未开");
+}
+
 static void cfg_prov_cb(lv_event_t *e)
 {
     (void)e;
-    if (app_prov_is_active()) {
-        app_prov_stop();
-        ESP_LOGI(TAG, "配网：热点已关");
-    } else {
-        app_prov_clear_result();
-        esp_err_t r = app_prov_start();
-        if (r == ESP_OK) ESP_LOGI(TAG, "配网：热点已开 %s", app_prov_ssid());
-        else             ESP_LOGW(TAG, "配网：开不了热点（%s）", esp_err_to_name(r));
-    }
-    cfg_prov_refresh();
+    /* ★★ 10-09：入口语义改了 —— 不再是"开关热点"，而是【进入配网界面】。
+     *   热点由引导层负责开关（进层开、出层关），
+     *   这样"设置面板里这一行"与"引导层"不会各持一套状态、互相打架。*/
+    cfg_panel_destroy();     /* 先让位：引导层是全屏的，盖着设置面板没意义 */
+    prov_panel_open();
 }
 
 /* ---------- 设备信息（硬件状态）---------- */
@@ -428,20 +669,10 @@ static void cfg_tick_cb(lv_timer_t *t)
 static void cfg_close_cb(lv_event_t *e)
 {
     (void)e;
-    /* ★★★ 顺序：先删 timer 再删面板对象。
-     *   timer 回调每秒都在访问面板里的 label —— 先删对象的话，
-     *   在下一次 tick 到来前若 LVGL 还没处理完删除，就是悬空指针。
-     *   （本工程统一规矩：leave/tick 一律"先停 timer 再删对象"。）*/
-    if (s_cfg_tick) { lv_timer_del(s_cfg_tick); s_cfg_tick = NULL; }
-
-    /* ★ 异步删：本回调来自面板【内部】的按钮，同步删 = 事件处理中途
-     *   拆掉事件源对象的祖先（LVGL 事件返回后仍会访问它）。*/
-    if (s_set_panel) { lv_obj_del_async(s_set_panel); s_set_panel = NULL; }
-    s_cfg_vol_lbl = s_cfg_bl_lbl = s_cfg_snd_lbl = NULL;
-    s_cfg_snd_btn = NULL;
-    s_cfg_prov_btn = s_cfg_prov_lbl = NULL;
-    s_cfg_info = NULL;
-    s_cfg_sc = NULL;
+    /* ★ 拆面板的实体在 cfg_panel_destroy()（10-09 抽出）——
+     *   ✕ 与「进配网」共用同一份，两条路必须行为一致。
+     *   里面守着本工程的硬规矩：先 lv_timer_del 再 lv_obj_del_async。*/
+    cfg_panel_destroy();
 }
 
 /* ============================================================
@@ -855,6 +1086,21 @@ void ui_shell_demo_prov(void)
     ESP_LOGI(TAG, "ui_demo prov: 已代按配网键（现在 %s，状态「%s」）",
              app_prov_is_active() ? "热点开" : "热点关",
              app_prov_is_active() ? app_prov_ssid() : "-");
+}
+
+/* ★★ 10-09 新增：代按引导层底部的「关闭热点，回首页」。
+ * 为什么必须有一条能"关"的命令：
+ *   引导层的关闭路径做三件事（停 timer → 异步删层 → 关热点），
+ *   而"点 ✕ 走"和"点按钮走"共用同一个回调 —— 这条路径要是没命令能走，
+ *   就只能靠读代码相信它对（本工程铁律 65/66：调试命令要幂等、能反着走）。*/
+void ui_shell_demo_prov_close(void)
+{
+    if (!s_prov_panel) {
+        ESP_LOGW(TAG, "ui_demo provclose: 引导层没开着");
+        return;
+    }
+    prov_close_cb(NULL);
+    ESP_LOGI(TAG, "ui_demo provclose: 已代按关闭（timer 先删、层异步删、热点已收）");
 }
 
 /* ★★ 10-08 新增：把【当前活动屏】的直接子对象全列出来。
