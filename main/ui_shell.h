@@ -55,6 +55,12 @@ void ui_shell_demo_cfg_scroll(int y);
  *   须先 ui_shell_demo_cfg()，并在 LVGL 锁内调用。*/
 void ui_shell_demo_prov(void);
 
+/* ★★ 10-09 调试用：代按【配网引导层】底部的「关闭热点，回首页」。
+ * 为什么需要：引导层的关闭路径做三件事（停 timer → 异步删层 → 关热点），
+ *   而没有手指就走不到这条路 ⇒ 只能读代码"相信"它对。
+ *   走的是 ✕ 与按钮【同一个回调】（prov_close_cb）。须在 LVGL 锁内调用。*/
+void ui_shell_demo_prov_close(void);
+
 /* ★ 10-08 调试用：代按设置面板右上角的 ✕（关闭）。
  * 为什么需要：关闭路径会先 lv_timer_del 再异步删面板（防悬空指针），
  * 而这条路"一次都没在真机上走"过 —— 面板能用命令开、却没命令能关。
