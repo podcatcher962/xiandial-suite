@@ -72,6 +72,9 @@ void      app_net_scan_start(void);    /* 非阻塞：起一次性任务扫描 A
 bool      app_net_scan_running(void);
 /* 读取上次扫描结果第 idx 条（0-based）：返回 false 表示越界 */
 bool      app_net_scan_get(int idx, char *name, int name_len, int *rssi);
+/* 上次扫描留下的条数。0 = 没有任何可用结果（从未扫过 / 扫失败 / 全被踢掉）。
+ * ★ 配网页的 /ssids 靠这个判「要不要现扫一次」——见 app_prov.c h_ssids()。*/
+int       app_net_scan_count(void);
 const char *app_net_state_str(void);
 
 /* ---- 从 SD 卡上的文本文件读 WiFi 账密并连接 ----
