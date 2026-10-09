@@ -708,6 +708,18 @@ static void scan_task(void *arg)
         free(recs);
     }
     ESP_LOGI(TAG, "wifi scan done: %u APs found (kept %d)", (unsigned)num, s_ap_count);
+
+    /* ★★ 10-09 修：扫完【就地】排序+去重+踢弱。
+     *   放在 s_scan_running=false 之前 —— 等待方（配网页 /ssids）一看到
+     *   running 变 false 就会去读 s_aps，必须保证那一刻数据已经是整理好的。
+     *
+     *   为什么必须在这里调（而不是在读取方每次调）：sort 的过滤里有
+     *   「踢掉 < -85 dBm」，它和「按信号降序」是配套的；读取方反复调虽然
+     *   幂等，但会把「整理」这件事散落在多个调用点 —— 本 bug 的成因正是
+     *   「写数据的路径和读数据的路径各自以为对方会调 sort」，结果谁都没调。
+     *   ⇒ 规矩：谁生产 s_aps，谁负责让它是可用的。*/
+    app_net_scan_sort_by_rssi();
+
     s_scan_running = false;
     vTaskDelete(NULL);
 }
@@ -808,3 +820,5 @@ bool app_net_scan_get(int idx, char *name, int name_len, int *rssi)
     if (rssi) *rssi = s_aps[idx].rssi;
     return true;
 }
+
+int app_net_scan_count(void) { return s_ap_count; }
