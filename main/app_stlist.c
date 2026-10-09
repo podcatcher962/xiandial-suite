@@ -24,6 +24,7 @@
 #include "ui_radio_v.h"       /* ★ 10-08：radio 调试口（竖版电台的分类/滚动/本地）*/
 #include "ui_stock.h"         /* ★ 10-08：stk_kline 跳页（截图调试用） */
 #include "ui_weather.h"       /* ★ 10-08：ui_demo speak（播报链路调试）*/
+#include "app_prov.h"          /* ★ 10-09：wifiscan（配网页下拉的数据源）*/
 #include "esp_lvgl_port.h"    /* ★ lgl_port_lock/unlock：跳页必须持 LVGL 锁 */
 /* ★ 10-08：lq_shot 要 lv_obj_invalidate / lv_refr_now / lv_screen_active。
  *   不能靠 esp_lvgl_port.h 间接带进来 —— 那是个实现细节，
@@ -1024,8 +1025,8 @@ static void st_serial_task(void *arg)
                   "st_rm <f> / st_play <下标> / lq_play <n> / lq_shot / "
                   "lq_demo <page|set> [签号] / lq_mem / "
                   "app_open <n> / app_home / radio <view|tap|scroll|filter|cattab|sd> / "
-                  "stk_kline <idx> / "
-                  "ui_demo <cfg|cfg <y>|cfgclose|prov|dump|speak|add>");
+                  "stk_kline <idx> / wifiscan / "
+                  "ui_demo <cfg|cfg <y>|cfgclose|prov|provclose|dump|speak|add|power>");
 
     /* ★ 驱动已被控制台装好了（usb_serial_jtag_vfs_dev_port_init 在启动时
      *   调了 driver_install + vfs_use_driver），这里只管读。
@@ -1216,6 +1217,8 @@ static void st_serial_task(void *arg)
                                 ui_shell_demo_dump();        /* 只读，不改状态 */
                             else if (strcmp(what, "prov") == 0)
                                 ui_shell_demo_prov();       /* 需先 ui_demo cfg */
+                            else if (strcmp(what, "provclose") == 0)
+                                ui_shell_demo_prov_close(); /* 代按引导层底部按钮 */
                             else if (strcmp(what, "speak") == 0)
                                 ui_weather_demo_speak();    /* 需先 app_open 2（见 APPS 表）*/
                             else if (strcmp(what, "add") == 0)
@@ -1229,8 +1232,15 @@ static void st_serial_task(void *arg)
                             ESP_LOGW(TAG, "ui_demo: 拿不到 LVGL 锁");
                         }
                     } else {
-                        ESP_LOGW(TAG, "ui_demo: 用法 ui_demo <cfg|cfg <y>|cfgclose|prov|dump|speak|add|power>");
+                        ESP_LOGW(TAG, "ui_demo: 用法 ui_demo <cfg|cfg <y>|cfgclose|prov|provclose|dump|speak|add|power>");
                     }
+                } else if (strcmp(t, "wifiscan") == 0) {
+                    /* ★ 10-09：把配网页「WiFi 名称」下拉的数据源打出来。
+                     *   起因：兰兰报「配网 WiFi 连接后，下拉是空的」——
+                     *   下拉读的是 s_aps[]，而填它的路径从未被调用过。
+                     *   这条命令【不持 LVGL 锁】（里面要等扫描数秒），
+                     *   所以单独成一条，不塞进 ui_demo（那个在锁内跑）。*/
+                    app_prov_scan_dump();
                 } else if (strcmp(t, "lq_shot") == 0) {
                     /* ★ 10-07：把当前屏幕整帧吐给 PC（见 st_shot 的注释）*/
                     st_shot();
