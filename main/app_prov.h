@@ -59,6 +59,12 @@ const char *app_prov_ssid(void);
 /* 已连上来的手机数（lwip 的 AP 站点表）。只用来打日志自证。*/
 int       app_prov_clients(void);
 
+/* ★ 10-09 调试：触发一次 AP 扫描并把结果逐条打进日志，返回条数。
+ *   配网页那个「WiFi 名称」下拉的数据源就是这份列表，所以真机排查
+ *   「下拉是空的」时，跑一条串口命令（wifiscan）就能看清是哪一环断的：
+ *   扫不到 ⇒ 环境/射频问题；扫到了但下拉空 ⇒ 接线（h_ssids）问题。*/
+int       app_prov_scan_dump(void);
+
 /* 手机提交账密后的结果（给屏幕显示）：
  *   0 还没提交 / 1 正在连 / 2 连上了 / 3 密码错或找不到 / 4 参数不对 */
 int       app_prov_result(void);
